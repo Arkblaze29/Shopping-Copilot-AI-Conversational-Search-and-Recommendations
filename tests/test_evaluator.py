@@ -19,6 +19,27 @@ class EchoTargetAgent:
         return {"message": "ok", "ask_attribute": None, "recommendations": [{"parent_asin": asin}]}
 
 
+class DiagnosticMissAgent:
+    def reset(self, session_id: str, user_profile: dict) -> None:
+        self.session_id = session_id
+
+    def respond(self, session_id: str, user_message: str, turn: int, top_k: int) -> dict:
+        return {"message": "ok", "ask_attribute": None, "recommendations": [{"parent_asin": "B"}]}
+
+    def debug_session(self, session_id: str) -> dict:
+        return {
+            "retrieval_history": [{
+                "turn": 1,
+                "intent": "buying",
+                "active_slots": {"category": "shoe"},
+                "query_terms": ["shoe"],
+                "sparse_pool": ["B", "A"],
+                "ranked_pool": ["B", "A"],
+                "ask_attribute": None,
+            }]
+        }
+
+
 class EvaluatorTest(unittest.TestCase):
     def test_normalization_preserves_first_valid_unique_order(self) -> None:
         payload = [
@@ -79,6 +100,24 @@ class EvaluatorTest(unittest.TestCase):
             }]
             result = evaluate(EchoTargetAgent(), samples, catalog_ids, categories, products)
             self.assertEqual(result["hit_rate_at_10"], 1.0)
+
+    def test_diagnostics_distinguish_ranking_from_retrieval_misses(self) -> None:
+        products = {
+            "A": {"parent_asin": "A", "title": "shoe"},
+            "B": {"parent_asin": "B", "title": "boot"},
+        }
+        samples = [{
+            "sample_id": "diagnostic",
+            "scenario_type": "buying",
+            "user_profile": {},
+            "ground_truth": {"parent_asin": "A"},
+        }]
+        result = evaluate(
+            DiagnosticMissAgent(), samples, {"A", "B"}, {"A": ["Shoes"]}, products,
+            include_diagnostics=True,
+        )
+        self.assertEqual(result["diagnostic_summary"]["failure_modes"], {"ranking": 1})
+        self.assertEqual(result["diagnostic_summary"]["recall_pool_hit_rate"], 1.0)
 
 
 if __name__ == "__main__":

@@ -219,6 +219,8 @@ def evaluate(
     catalog_ids: set[str],
     categories: dict[str, list[str]],
     products: dict[str, dict],
+    *,
+    include_diagnostics: bool = False,
 ) -> dict:
     sessions: list[dict] = []
     total_prompt_tokens = 0
@@ -235,6 +237,7 @@ def evaluate(
         user_message = initial_message(effective_sample, coarse_category(categories.get(target, [])), disclosed)
         hit_turn: int | None = None
         best_rank: int | None = None
+        turn_diagnostics: list[dict] = []
         for turn in range(1, MAX_TURNS + 1):
             try:
                 response = agent.respond(session_id, user_message, turn, TOP_K)
@@ -249,6 +252,26 @@ def evaluate(
                 if isinstance(usage.get("completion_tokens"), int) and usage["completion_tokens"] >= 0:
                     total_completion_tokens += usage["completion_tokens"]
             ranked = normalize_recommendations(response.get("recommendations"), catalog_ids)
+            if include_diagnostics:
+                debug_session = getattr(agent, "debug_session", None)
+                debug = debug_session(session_id) if callable(debug_session) else {}
+                history = debug.get("retrieval_history", []) if isinstance(debug, dict) else []
+                trace = history[-1] if isinstance(history, list) and history else {}
+                sparse_pool = trace.get("sparse_pool", []) if isinstance(trace, dict) else []
+                reranked_pool = trace.get("ranked_pool", []) if isinstance(trace, dict) else []
+                turn_diagnostics.append({
+                    "turn": turn,
+                    "eligible_for_hit": override_applied,
+                    "user_message": user_message,
+                    "intent": trace.get("intent") if isinstance(trace, dict) else None,
+                    "active_slots": trace.get("active_slots", {}) if isinstance(trace, dict) else {},
+                    "query_terms": trace.get("query_terms", []) if isinstance(trace, dict) else [],
+                    "ask_attribute": response.get("ask_attribute"),
+                    "recall_pool_size": len(sparse_pool),
+                    "target_sparse_rank": sparse_pool.index(target) + 1 if target in sparse_pool else None,
+                    "target_reranked_rank": reranked_pool.index(target) + 1 if target in reranked_pool else None,
+                    "target_recommended_rank": ranked.index(target) + 1 if target in ranked else None,
+                })
             if override_applied and target in ranked:
                 best_rank = ranked.index(target) + 1
                 hit_turn = turn
@@ -266,14 +289,28 @@ def evaluate(
                 user_message, boundary_used = customer_reply(
                     effective_sample, response.get("ask_attribute"), disclosed, boundary_used
                 )
-        sessions.append({
+        session_result = {
             "sample_id": sample["sample_id"],
             "scenario_type": sample["scenario_type"],
             "hit": hit_turn is not None,
             "first_hit_turn": hit_turn,
             "best_rank": best_rank,
             "reciprocal_rank": 0.0 if best_rank is None else 1.0 / best_rank,
-        })
+        }
+        if include_diagnostics:
+            eligible_turns = [item for item in turn_diagnostics if item["eligible_for_hit"]]
+            entered_recall_pool = any(item["target_sparse_rank"] is not None for item in eligible_turns)
+            entered_top_10 = any(item["target_recommended_rank"] is not None for item in eligible_turns)
+            failure_mode = None
+            if hit_turn is None:
+                failure_mode = "ranking" if entered_recall_pool else "retrieval"
+            session_result["diagnostics"] = {
+                "entered_recall_pool": entered_recall_pool,
+                "entered_top_10": entered_top_10,
+                "failure_mode": failure_mode,
+                "turns": turn_diagnostics,
+            }
+        sessions.append(session_result)
 
     overall = metric_summary(sessions)
     efficiency = max(0.0, min(1.0, (11.0 - float(overall["mttc"])) / 10.0))
@@ -281,7 +318,7 @@ def evaluate(
     grouped: dict[str, list[dict]] = defaultdict(list)
     for session in sessions:
         grouped[session["scenario_type"]].append(session)
-    return {
+    result = {
         **overall,
         "efficiency": round(efficiency, 6),
         "recommended_technical_score": round(technical_score, 6),
@@ -293,6 +330,19 @@ def evaluate(
         "scenario_metrics": {name: metric_summary(grouped[name]) for name in sorted(grouped)},
         "sessions": sessions,
     }
+    if include_diagnostics:
+        eligible_sessions = [item for item in sessions if item.get("diagnostics")]
+        recall_hits = sum(int(item["diagnostics"]["entered_recall_pool"]) for item in eligible_sessions)
+        failures: dict[str, int] = defaultdict(int)
+        for item in eligible_sessions:
+            mode = item["diagnostics"]["failure_mode"]
+            if mode:
+                failures[mode] += 1
+        result["diagnostic_summary"] = {
+            "recall_pool_hit_rate": round(recall_hits / len(eligible_sessions), 6) if eligible_sessions else 0.0,
+            "failure_modes": dict(sorted(failures.items())),
+        }
+    return result
 
 
 def main() -> None:
@@ -300,10 +350,18 @@ def main() -> None:
     parser.add_argument("--catalog", default="data/catalog.jsonl")
     parser.add_argument("--dataset", default="data/public_set.jsonl")
     parser.add_argument("--output", default="results.json")
+    parser.add_argument(
+        "--diagnostics",
+        action="store_true",
+        help="Include target-aware retrieval diagnostics in the output file.",
+    )
     args = parser.parse_args()
     samples = load_jsonl(args.dataset)
     catalog_ids, categories, products = catalog_index(args.catalog)
-    result = evaluate(Agent(args.catalog), samples, catalog_ids, categories, products)
+    result = evaluate(
+        Agent(args.catalog), samples, catalog_ids, categories, products,
+        include_diagnostics=args.diagnostics,
+    )
     Path(args.output).write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     print(json.dumps({key: value for key, value in result.items() if key != "sessions"}, indent=2))
 
