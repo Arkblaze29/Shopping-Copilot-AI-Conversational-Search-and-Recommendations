@@ -424,6 +424,7 @@ class Agent:
                 and not declined_match
                 and not global_override
                 and not CONTINUATION_RE.search(user_message)
+                and (is_structured_clarification or ";" in user_message)
             )
             else []
         )
