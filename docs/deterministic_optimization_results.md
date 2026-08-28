@@ -28,10 +28,10 @@ choices. Diagnostic fields are evaluator-only and do not change the agent API.
 
 | Metric | Start of pass | Accepted result | Change |
 | --- | ---: | ---: | ---: |
-| Technical score | 0.784767 | 0.840644 | +0.055877 |
-| Hit Rate@10 | 0.945000 | 0.990000 | +0.045000 |
-| MRR | 0.544224 | 0.616480 | +0.072256 |
-| MTTC | 3.550000 | 2.965000 | -0.585000 |
+| Technical score | 0.784767 | 0.845444 | +0.060677 |
+| Hit Rate@10 | 0.945000 | 0.995000 | +0.050000 |
+| MRR | 0.544224 | 0.621480 | +0.077256 |
+| MTTC | 3.550000 | 2.925000 | -0.625000 |
 
 ### Scenario metrics
 
@@ -39,7 +39,7 @@ choices. Diagnostic fields are evaluator-only and do not change the agent API.
 | --- | ---: | ---: | ---: |
 | Boundary | 1.000000 | 0.662500 | 3.000000 |
 | Browsing | 1.000000 | 0.627703 | 2.675000 |
-| Buying | 0.975000 | 0.594315 | 2.500000 |
+| Buying | 0.987500 | 0.606815 | 2.400000 |
 | Intent Override | 1.000000 | 0.630317 | 4.966667 |
 
 ## Changes retained
@@ -59,6 +59,8 @@ choices. Diagnostic fields are evaluator-only and do not change the agent API.
 - Added a bounded cross-session retrieval cache and runtime/query counters.
 - Added a reproducible prebuilt SQLite catalog index with schema/catalog validation
   and an automatic build-from-catalog fallback.
+- Prevented dimension phrases such as `up to 8-inch` from being interpreted as
+  price constraints. This recovered one general parser-driven ranking miss.
 
 - Preserved unrecognized product/category subject terms across turns.
 - Removed declined-preference and retry boilerplate from retrieval queries.
@@ -74,8 +76,8 @@ choices. Diagnostic fields are evaluator-only and do not change the agent API.
   rotates unseen candidates ahead of repeats.
 - Clears shown-product rejection history when the user globally overrides intent.
 - Keeps declined clarification attributes neutral while preventing repeated questions.
-- Expanded the internal sparse pool to 500 while retaining a fixed top-100 BM25
-  score gradient. The evaluator still contains 200 sessions and only Top 10 is returned.
+- Retains a fixed top-100 BM25 score gradient while retrieving a 300-item sparse
+  pool. The evaluator still contains 200 sessions and only Top 10 is returned.
 
 ## Rejected experiment
 
@@ -89,13 +91,18 @@ Hit Rate. The proven sparse/facet weights were retained.
 
 ## Runtime sample
 
-Building the 50,000-product derived index took approximately 79.7 seconds once on
-the current Windows development environment. Loading that artifact into memory
-took approximately 0.6–0.7 seconds. The one-lane/300-candidate runtime screen used
-57 FTS queries for 62 responses and completed in 12.43 seconds; the equivalent
-three-lane/500-candidate screen performed substantially more work. Wall-clock
-timings varied under sandbox CPU contention, so query counts and full evaluator
-metrics are the reproducible acceptance signals.
+Building the 50,000-product derived index took 15.77 seconds in the current Linux
+environment; building from the catalog during evaluator startup took 14.94 seconds.
+Loading the artifact into memory took 0.23–0.30 seconds. The accepted full run
+performed 501 FTS queries for 584 responses and completed evaluation in 33.98
+seconds. Peak resident memory was 978588 KiB (about 956 MiB), including the
+in-memory SQLite copy and evaluator catalog structures. Wall-clock timings vary
+under CPU contention, so metrics and query counts remain the reproducible signals.
+
+The available alternate `new_set.jsonl` retained 0.960 Hit Rate@10 and scored
+0.826838. Relative to the committed parser baseline, one Intent Override session
+converted two turns earlier at a lower target rank; aggregate technical score moved
+by -0.000149 while Hit Rate was unchanged.
 
 ## Clarification policy evidence
 
@@ -116,8 +123,11 @@ accepted full-set checkpoint above.
 
 ## Remaining deterministic targets
 
-- Diagnose the two remaining full-set misses under the accepted `0.75` weight.
-- Re-run the accepted configuration on restored diverse datasets before submission.
-- Measure peak memory with a platform profiler outside the sandbox.
+- Keep the remaining `public_0020` ambiguity/ranking miss diagnosed unless a
+  general change improves both the public and alternate sets.
+- Re-run on any recovered historical diverse datasets before submission.
+- Re-measure peak memory on the intended submission host.
+- Confirm whether package rules allow the ignored 202 MiB prebuilt index as a
+  separately disclosed artifact; otherwise use the build-from-catalog fallback.
 - Keep dense retrieval deferred until a separate, optional experiment is
   explicitly approved.

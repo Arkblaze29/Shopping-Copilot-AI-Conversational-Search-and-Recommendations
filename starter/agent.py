@@ -41,23 +41,27 @@ STOPWORDS = {
 
 RANGE_PRICE_RE = re.compile(
     r"\bbetween\s*(?:\$|usd\s*)?(\d+(?:\.\d{1,2})?)\s*(?:and|to|-)\s*"
-    r"(?:\$|usd\s*)?(\d+(?:\.\d{1,2})?)\b",
+    r"(?:\$|usd\s*)?(\d+(?:\.\d{1,2})?)(?![\d.])"
+    r"(?!\s*-?\s*(?:inch(?:es)?|mm|cm)\b)",
     re.IGNORECASE,
 )
 MAX_PRICE_RE = re.compile(
     r"\b(?:under|below|less than|up to|at most|max(?:imum)?(?: price)?)\s*"
-    r"(?:\$|usd\s*)?(\d+(?:\.\d{1,2})?)\b",
+    r"(?:\$|usd\s*)?(\d+(?:\.\d{1,2})?)(?![\d.])"
+    r"(?!\s*-?\s*(?:inch(?:es)?|mm|cm)\b)",
     re.IGNORECASE,
 )
 MIN_PRICE_RE = re.compile(
     r"\b(?:over|above|more than|at least|minimum(?: price)?)\s*"
-    r"(?:\$|usd\s*)?(\d+(?:\.\d{1,2})?)\b",
+    r"(?:\$|usd\s*)?(\d+(?:\.\d{1,2})?)(?![\d.])"
+    r"(?!\s*-?\s*(?:inch(?:es)?|mm|cm)\b)",
     re.IGNORECASE,
 )
 GLOBAL_OVERRIDE_RE = re.compile(r"\b(?:ignore|replace)\s+(?:my\s+)?(?:earlier|previous|old)\s+preference\b", re.I)
 TARGET_PRICE_RE = re.compile(
     r"\b(?:(?:around|about|approximately|roughly)|budget(?:\s+of)?)\s*"
-    r"(?:\$|usd\s*)?(\d+(?:\.\d{1,2})?)\b",
+    r"(?:\$|usd\s*)?(\d+(?:\.\d{1,2})?)(?![\d.])"
+    r"(?!\s*-?\s*(?:inch(?:es)?|mm|cm)\b)",
     re.I,
 )
 BARE_PRICE_RE = re.compile(r"(?:\$|\busd\s*)(\d+(?:\.\d{1,2})?)\b", re.I)

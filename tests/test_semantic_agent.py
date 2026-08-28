@@ -34,6 +34,20 @@ class SemanticAgentTest(unittest.TestCase):
         self.assertEqual(slots["target_price"], 50.0)
         self.assertNotIn("max_price", slots)
 
+    def test_dimensions_are_not_misclassified_as_price_limits(self) -> None:
+        examples = (
+            "fits up to 8-inch wrist circumference",
+            "at least 18mm wide",
+            "approximately 30 cm long",
+            "between 8 and 10 inches long",
+        )
+        for text in examples:
+            with self.subTest(text=text):
+                slots = extract_slots(text)
+                self.assertFalse(
+                    {"min_price", "max_price", "target_price"} & slots.keys()
+                )
+
     def test_product_facets_preserve_category_and_semantics(self) -> None:
         product = {
             "categories": ["Clothing, Shoes & Jewelry", "Men", "Shoes", "Hiking Boots"],

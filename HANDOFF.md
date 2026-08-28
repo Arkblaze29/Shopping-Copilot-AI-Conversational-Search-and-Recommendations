@@ -4,7 +4,7 @@
 
 The implementation is runnable and verified on 28 August 2026.
 
-- `41` unit tests pass.
+- `42` unit tests pass.
 - Python compilation passes for the agent, evaluator, and experiment tools.
 - Real-catalog Boundary smoke evaluation passes all 10 sessions:
   - Hit Rate@10: `1.000`
@@ -18,12 +18,12 @@ The accepted full 200-session result is:
 
 | Metric | Previous checkpoint | Current checkpoint |
 | --- | ---: | ---: |
-| Technical score | 0.784767 | **0.840644** |
-| Hit Rate@10 | 0.945 | **0.990** |
-| MRR | 0.544224 | **0.616480** |
-| MTTC | 3.550 | **2.965** |
+| Technical score | 0.784767 | **0.845444** |
+| Hit Rate@10 | 0.945 | **0.995** |
+| MRR | 0.544224 | **0.621480** |
+| MTTC | 3.550 | **2.925** |
 
-Scenario Hit Rate@10: Boundary `1.000`, Browsing `1.000`, Buying `0.975`, Intent Override `1.000`.
+Scenario Hit Rate@10: Boundary `1.000`, Browsing `1.000`, Buying `0.9875`, Intent Override `1.000`.
 
 ## What was implemented
 
@@ -34,6 +34,7 @@ Scenario Hit Rate@10: Boundary `1.000`, Browsing `1.000`, Buying `0.975`, Intent
 - Added a continuation guard so `show me more` is not stored as a clarification value.
 - Added retrieval caching, FTS query counters, response timings, disclosure diagnostics, and scenario-focused evaluator runs.
 - Added a reproducible prebuilt SQLite catalog index. It is validated, copied into memory at startup, and falls back to rebuilding from `catalog.jsonl`.
+- Prevented dimensions such as `up to 8-inch` and `at least 18mm` from being parsed as price constraints. This converted `public_0042` without changing the retrieval configuration.
 - Added scenario-stratified policy, runtime, coarse, coordinate, and sparse-weight experiment tooling.
 - Converged defaults to:
   - clarification policy: `other_second`
@@ -52,7 +53,7 @@ The unconditional two-`other` hypothesis was tested and rejected. On the fixed 2
 - `experiments/build_index.py`: prebuilt index generator.
 - `docs/deterministic_optimization_results.md`: experiment evidence and accepted metrics.
 
-`data/catalog_index.sqlite` currently exists locally and is approximately 212 MB. It is ignored by Git to prevent accidental repository upload. Build it after obtaining the catalog, or include it separately in the final submission package if package rules permit.
+`data/catalog_index.sqlite` currently exists locally and is approximately 202 MiB. It is ignored by Git to prevent accidental repository upload. Build it after obtaining the catalog. Keep it out of Git and include it only as a separately disclosed submission artifact if package size rules permit.
 
 ## Reproduction commands
 
@@ -78,17 +79,17 @@ Experiment output files are ignored by Git. Always validate a screen winner on a
 
 ## Remaining work
 
-1. Run one final full default evaluation after checkout/package assembly and confirm it reproduces `0.840644`.
-2. Restore the historical diverse datasets and evaluate the accepted defaults for generalization. They are not in the current workspace.
-3. Diagnose the two remaining public-set misses. The previous `0.69` diagnostic run had three ranking misses (`public_0020`, `public_0042`, `public_0052`); increasing sparse weight to `0.75` converted one of them, but the final two IDs were not re-diagnosed.
-4. Measure peak memory outside the sandbox. Loading the 212 MB SQLite artifact into memory showed roughly 0.9 GB working-set usage during long local runs.
-5. Decide how the generated index will be packaged. The agent remains correct without it, but startup rebuilding took about 79.7 seconds on this machine; loading the artifact normally took under three seconds.
-6. Review the working-tree diff and commit the implementation. All current modified/untracked source files belong to this optimization pass.
-7. Defer local/LLM integration to a later phase, as requested.
+1. Run one final full default evaluation after final package assembly and confirm it reproduces `0.845444`.
+2. Restore any historical diverse datasets if they are recovered. The available `new_set.jsonl` was evaluated at technical score `0.826838`, Hit Rate@10 `0.960`, MRR `0.633792`, and MTTC `3.165`.
+3. Keep `public_0020` as a diagnosed ambiguity/ranking miss unless a general fix improves full-set and diverse-set metrics. The target remains in recall, but the disclosed generic novelty-shirt constraints do not distinguish it within ten Top-10 pages.
+4. Re-measure peak memory on the intended submission host. The current Linux run peaked at `978588` KiB (about 956 MiB) while loading the SQLite artifact into memory and retaining evaluator catalog structures.
+5. Confirm the submission package size rules. Keep the generated index out of Git; include it separately only if allowed, otherwise use the documented build-from-catalog fallback.
+6. Defer local/LLM integration to a later phase, as requested.
 
 ## Caveats
 
-- Wall-clock evaluation time varied heavily because of sandbox CPU contention. Use technical metrics and query counts for deterministic comparisons; rerun runtime measurements on the intended submission machine.
+- With the prebuilt index, initialization measured `0.23`–`0.30` seconds and the full 200-session evaluation measured about `34` seconds. Without it, initialization measured `14.94` seconds on the current Linux environment.
+- Wall-clock evaluation time varies with CPU contention. Use technical metrics and query counts for deterministic comparisons; rerun runtime measurements on the intended submission machine.
 - The official evaluator code computes efficiency as `clip((11 - MTTC) / 10, 0, 1)`.
 - The prebuilt index is catalog-derived and contains no hidden labels, but its inclusion and reproducibility instructions should be disclosed in the submission.
 - Do not tune only against the three known misses. Protect full-set and diverse-set Hit@10 before accepting further weight changes.
