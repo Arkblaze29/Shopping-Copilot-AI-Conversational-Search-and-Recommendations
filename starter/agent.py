@@ -4,8 +4,11 @@ import json
 import math
 import re
 import sqlite3
+from collections import OrderedDict
 from pathlib import Path
+from time import perf_counter
 
+from starter.config import AgentConfig
 from starter.semantics import (
     CATEGORY_ALIASES,
     CATEGORY_PARENTS,
@@ -36,8 +39,6 @@ STOPWORDS = {
     "key", "matters", "options", "preference", "requirement", "specific", "what",
 }
 
-RECALL_POOL_SIZE = 500
-SPARSE_RANK_WINDOW = 100
 RANGE_PRICE_RE = re.compile(
     r"\bbetween\s*(?:\$|usd\s*)?(\d+(?:\.\d{1,2})?)\s*(?:and|to|-)\s*"
     r"(?:\$|usd\s*)?(\d+(?:\.\d{1,2})?)\b",
@@ -68,7 +69,7 @@ NEGATION_ATTRIBUTE_RE = re.compile(
 DECLINE_RE = re.compile(
     r"\b(?:(?:no|without)\s+(?:a\s+)?preference\s+for|"
     r"(?:don't|do not)\s+have\s+(?:an?\s+)?(?:additional\s+)?preference\s+for)\s*"
-    r"(category|material|color|size|style|brand|budget|feature|use[_ ]case)\b",
+    r"(category|material|color|size|style|brand|budget|feature|use[_ ]case|other)\b",
     re.IGNORECASE,
 )
 LOOKING_FOR_RE = re.compile(
@@ -79,6 +80,7 @@ RETRY_MESSAGE_RE = re.compile(
     r"\bthose options are not quite right yet\b|\bask me about one specific attribute\b",
     re.IGNORECASE,
 )
+CONTINUATION_RE = re.compile(r"^\s*(?:show me more|more options|show more|try again)\s*[.!]?\s*$", re.I)
 CLARIFICATION_RESPONSE_RE = re.compile(
     r"^\s*(?:for that\b|my preference is\b|i prefer\b|it should be\b)",
     re.IGNORECASE,
@@ -218,26 +220,110 @@ def _slot_strength(text: str, key: str) -> str:
     return "hard"
 
 
-def _clarification_answer(text: str) -> str | None:
+def _clarification_values(text: str) -> list[str]:
     if re.search(r"\b(?:no|not)\s+(?:an?\s+)?(?:additional\s+)?preference\b", text, re.I):
-        return None
+        return []
     cleaned = re.sub(r"^\s*for that,?\s*(?:what matters is\s*:?)?\s*", "", text, flags=re.I)
     cleaned = re.sub(r"^\s*(?:my preference is|i prefer|it should be)\s*:?[ ]*", "", cleaned, flags=re.I)
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" .;,\t\n")
-    return cleaned[:180] or None
+    if not cleaned:
+        return []
+    return [value.strip(" .;,\t\n")[:180] for value in cleaned.split(";") if value.strip(" .;,\t\n")]
+
+
+def _clarification_answer(text: str) -> str | None:
+    """Backward-compatible single-string view used by older callers/tests."""
+    values = _clarification_values(text)
+    return "; ".join(values) or None
+
+
+def _slot_values(value: object) -> tuple[str, ...]:
+    if isinstance(value, (tuple, list, set)):
+        return tuple(str(item).lower() for item in value if str(item).strip())
+    return (str(value).lower(),) if str(value).strip() else ()
+
+
+def _classify_clarification_value(value: str) -> tuple[str, object]:
+    """Mirror the evaluator's constraint classes without importing evaluator code."""
+    extracted = extract_slots(value)
+    for key in ("max_price", "min_price", "target_price"):
+        if key in extracted:
+            return key, extracted[key]
+    for key in ("material", "color", "size", "style", "use_case"):
+        if key in extracted:
+            return key, extracted[key]
+    return "feature", value.lower()
 
 
 class Agent:
     """Stateful offline shopping agent with sparse and semantic-facet retrieval."""
 
-    def __init__(self, catalog_path: str | Path = "data/catalog.jsonl") -> None:
+    INDEX_SCHEMA_VERSION = 1
+
+    def __init__(
+        self,
+        catalog_path: str | Path = "data/catalog.jsonl",
+        config: AgentConfig | None = None,
+        *,
+        index_path: str | Path | None = None,
+        use_prebuilt_index: bool = True,
+    ) -> None:
         self.catalog_path = Path(catalog_path)
-        self.connection = sqlite3.connect(":memory:")
+        self.config = config or AgentConfig()
+        self.index_path = Path(index_path) if index_path else self.catalog_path.with_name("catalog_index.sqlite")
         self.sessions: dict[str, SessionState] = {}
-        self._build_index()
+        self._retrieval_cache: OrderedDict[tuple, tuple[tuple, ...]] = OrderedDict()
+        self.runtime_stats = {
+            "responses": 0,
+            "response_seconds": 0.0,
+            "fts_queries": 0,
+            "cache_hits": 0,
+            "cache_misses": 0,
+        }
+        if use_prebuilt_index and self._prebuilt_index_is_valid(self.index_path):
+            source = sqlite3.connect(f"file:{self.index_path.as_posix()}?mode=ro", uri=True)
+            self.connection = sqlite3.connect(":memory:")
+            source.backup(self.connection)
+            source.close()
+            self.runtime_stats["index_source"] = "prebuilt"
+        else:
+            self.connection = sqlite3.connect(":memory:")
+            self._build_index()
+            self.runtime_stats["index_source"] = "memory"
+
+    def _prebuilt_index_is_valid(self, path: Path) -> bool:
+        if not path.is_file():
+            return False
+        try:
+            connection = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
+            row = connection.execute(
+                "SELECT schema_version, catalog_size FROM index_manifest LIMIT 1"
+            ).fetchone()
+            connection.close()
+            return bool(
+                row
+                and int(row[0]) == self.INDEX_SCHEMA_VERSION
+                and int(row[1]) == self.catalog_path.stat().st_size
+            )
+        except (OSError, sqlite3.Error, TypeError, ValueError):
+            return False
+
+    def configure(self, config: AgentConfig, *, clear_cache: bool = True) -> None:
+        """Switch experiment parameters while reusing the expensive catalog index."""
+        self.config = config
+        self.sessions.clear()
+        self.runtime_stats.update({
+            "responses": 0, "response_seconds": 0.0, "fts_queries": 0,
+            "cache_hits": 0, "cache_misses": 0,
+        })
+        if clear_cache:
+            self._retrieval_cache.clear()
 
     def _build_index(self) -> None:
         cursor = self.connection.cursor()
+        cursor.execute(
+            "CREATE TABLE index_manifest (schema_version INTEGER NOT NULL, catalog_size INTEGER NOT NULL)"
+        )
         cursor.execute(
             "CREATE VIRTUAL TABLE products USING fts5("
             "parent_asin UNINDEXED, title, categories, features, details, store, description, "
@@ -294,6 +380,10 @@ class Agent:
         if batch:
             cursor.executemany("INSERT INTO products VALUES (?, ?, ?, ?, ?, ?, ?)", batch)
             cursor.executemany("INSERT INTO product_metadata VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", metadata_batch)
+        cursor.execute(
+            "INSERT INTO index_manifest VALUES (?, ?)",
+            (self.INDEX_SCHEMA_VERSION, self.catalog_path.stat().st_size),
+        )
         self.connection.commit()
 
     def reset(self, session_id: str, user_profile: dict) -> None:
@@ -306,6 +396,7 @@ class Agent:
         turn: int,
         top_k: int,
     ) -> dict:
+        response_started = perf_counter()
         state = self.sessions.get(session_id)
         if state is None:
             raise RuntimeError("reset must be called before respond")
@@ -315,21 +406,25 @@ class Agent:
         subject_match = LOOKING_FOR_RE.search(user_message)
         if subject_match:
             state.subject_terms = list(dict.fromkeys(_terms(subject_match.group(1))))[:16]
-        extracted = extract_slots(user_message)
         global_override = bool(GLOBAL_OVERRIDE_RE.search(user_message))
-        if (
+        is_structured_clarification = bool(
             previous_attribute
             and not declined_match
             and not global_override
             and CLARIFICATION_RESPONSE_RE.search(user_message)
-        ):
-            allowed_keys = {
-                "budget": {"min_price", "max_price", "target_price"},
-            }.get(previous_attribute, {previous_attribute})
-            extracted = {
-                key: value for key, value in extracted.items()
-                if key in allowed_keys
-            }
+        )
+        clarification_values = (
+            _clarification_values(user_message)
+            if (
+                previous_attribute
+                and not declined_match
+                and not global_override
+                and not CONTINUATION_RE.search(user_message)
+            )
+            else []
+        )
+        state.last_clarification_count = len(clarification_values)
+        extracted = {} if is_structured_clarification else extract_slots(user_message)
         if global_override:
             state.clear_soft_preferences()
             state.asked_attributes.clear()
@@ -357,16 +452,33 @@ class Agent:
         if declined_match:
             declined = declined_match.group(1).lower().replace(" ", "_")
             state.declined_attributes.add(declined)
-        elif previous_attribute and not global_override:
-            represented = previous_attribute in extracted
-            if previous_attribute == "budget":
-                represented = bool(price_keys)
-            if not represented:
-                answer = _clarification_answer(user_message)
-                if answer:
-                    state.set_slot(
-                        previous_attribute, answer.lower(), turn, user_message,
-                        strength="hard",
+        elif (
+            previous_attribute
+            and clarification_values
+            and not global_override
+            and (is_structured_clarification or not extracted)
+        ):
+            state.clarification_values_received.extend(clarification_values)
+            if previous_attribute == "other":
+                for value in clarification_values:
+                    key, normalized = _classify_clarification_value(value)
+                    if key in {"min_price", "max_price", "target_price"}:
+                        for price_key in {"min_price", "max_price", "target_price"}:
+                            state.slots.pop(price_key, None)
+                        state.set_slot(key, normalized, turn, user_message, strength="hard")
+                    else:
+                        state.add_slot_value(key, normalized, turn, user_message, strength="hard")
+            elif previous_attribute == "budget":
+                for value in clarification_values:
+                    key, normalized = _classify_clarification_value(value)
+                    if key in {"min_price", "max_price", "target_price"}:
+                        for price_key in {"min_price", "max_price", "target_price"}:
+                            state.slots.pop(price_key, None)
+                        state.set_slot(key, normalized, turn, user_message, strength="hard")
+            else:
+                for value in clarification_values:
+                    state.add_slot_value(
+                        previous_attribute, value.lower(), turn, user_message, strength="hard"
                     )
         if previous_attribute:
             state.last_asked_attribute = None
@@ -375,18 +487,24 @@ class Agent:
         state.current_intent = self._classify_intent(user_message, active_slots)
         current_terms = [] if declined_match or RETRY_MESSAGE_RE.search(user_message) else _terms(user_message)
         context_terms = [
-            str(value) for key, value in active_slots.items()
+            item
+            for key, value in active_slots.items()
             if key not in {"max_price", "min_price", "target_price"}
+            for item in _slot_values(value)
         ]
         active_category = str(active_slots.get("category", "")).lower()
         category_query_terms = set(state.subject_terms)
         if active_category:
             category_query_terms.update(category_terms(active_category))
             category_query_terms.add(CATEGORY_PARENTS.get(active_category, ""))
-        expansion_terms = semantic_expansions({str(value).lower() for value in active_slots.values()})
+        expansion_terms = semantic_expansions({
+            item for value in active_slots.values() for item in _slot_values(value)
+        })
         constraint_terms = [
-            str(value) for key, value in active_slots.items()
+            item
+            for key, value in active_slots.items()
             if key not in {"max_price", "min_price", "target_price", "category"}
+            for item in _slot_values(value)
         ]
         lane_queries = [
             " ".join([
@@ -402,13 +520,9 @@ class Agent:
             recommendations: list[dict] = []
         else:
             rows = self._retrieve_multi_lane(
-                lane_queries, active_slots, max(top_k * 10, RECALL_POOL_SIZE)
+                lane_queries, active_slots, max(top_k * 10, self.config.recall_pool_size)
             )
             ranked_pool = self._rank_candidates(rows, state)
-            ranked_pool = [
-                *[asin for asin in ranked_pool if asin not in state.shown_asins],
-                *[asin for asin in ranked_pool if asin in state.shown_asins],
-            ]
             recommendations = [
                 {"parent_asin": asin} for asin in ranked_pool[:top_k]
             ]
@@ -418,7 +532,11 @@ class Agent:
         if ask_attribute:
             state.asked_attributes.append(ask_attribute)
             state.last_asked_attribute = ask_attribute
-            message = f"I found some options. Do you have a preference for {ask_attribute}?"
+            message = (
+                "I found some options. What else matters to you?"
+                if ask_attribute == "other"
+                else f"I found some options. Do you have a preference for {ask_attribute}?"
+            )
         else:
             message = "Here are the closest matches I found."
         state.retrieval_history.append({
@@ -430,6 +548,8 @@ class Agent:
             "sparse_pool": [str(row[0]) for row in rows],
             "ranked_pool": ranked_pool,
             "ask_attribute": ask_attribute,
+            "received_constraints": list(clarification_values),
+            "received_constraint_count": len(clarification_values),
         })
         response = {
             "message": message,
@@ -438,6 +558,11 @@ class Agent:
             "usage": {"prompt_tokens": 0, "completion_tokens": 0},
         }
         state.dialog_history.append({"role": "agent", "text": response["message"]})
+        elapsed = perf_counter() - response_started
+        self.runtime_stats["responses"] += 1
+        self.runtime_stats["response_seconds"] += elapsed
+        state.retrieval_history[-1]["response_seconds"] = elapsed
+        state.retrieval_history[-1]["fts_queries_total"] = self.runtime_stats["fts_queries"]
         return response
 
     def _retrieve_multi_lane(
@@ -447,8 +572,29 @@ class Agent:
         limit: int,
     ) -> list[tuple]:
         """Retrieve and merge title/category, constraint, and synonym candidates."""
+        normalized_lanes = tuple(
+            tuple(dict.fromkeys(_terms(query)))[:40]
+            for query in lane_queries[: self.config.max_retrieval_lanes]
+        )
+        cache_key = (
+            normalized_lanes,
+            active_slots.get("min_price"),
+            active_slots.get("max_price"),
+            limit,
+            self.config.fts_weights,
+            self.config.max_retrieval_lanes,
+        )
+        cached = self._retrieval_cache.get(cache_key)
+        if cached is not None:
+            self._retrieval_cache.move_to_end(cache_key)
+            self.runtime_stats["cache_hits"] += 1
+            return list(cached)
+        self.runtime_stats["cache_misses"] += 1
+        bm25_sql = "bm25(products, " + ", ".join(
+            f"{float(weight):.8g}" for weight in self.config.fts_weights
+        ) + ")"
         select_sql = (
-            "SELECT products.parent_asin, bm25(products, 0.0, 6.0, 4.0, 2.5, 2.5, 1.5, 1.0), "
+            f"SELECT products.parent_asin, {bm25_sql}, "
             "m.price, m.title, m.features, m.categories, m.details, m.searchable_text, "
             "m.department, m.product_type, m.subtype, m.materials, m.colors, m.sizes, "
             "m.styles, m.use_cases, m.brand, m.semantic_text "
@@ -456,8 +602,8 @@ class Agent:
         )
         merged: dict[str, tuple] = {}
         lane_limits = [max(1, min(350, limit)), max(1, min(150, limit)), max(1, min(50, limit))]
-        for lane_index, lane_query in enumerate(lane_queries):
-            terms = list(dict.fromkeys(_terms(lane_query)))[:40]
+        for lane_index, terms_tuple in enumerate(normalized_lanes):
+            terms = list(terms_tuple)
             if not terms:
                 continue
             expression = " OR ".join(f'"{term}"' for term in terms)
@@ -471,16 +617,22 @@ class Agent:
                 parameters.append(active_slots["min_price"])
             query = (
                 select_sql + f"WHERE {' AND '.join(predicates)} "
-                "ORDER BY bm25(products, 0.0, 6.0, 4.0, 2.5, 2.5, 1.5, 1.0), products.parent_asin LIMIT ?"
+                f"ORDER BY {bm25_sql}, products.parent_asin LIMIT ?"
             )
             lane_limit = lane_limits[min(lane_index, len(lane_limits) - 1)]
+            self.runtime_stats["fts_queries"] += 1
             for row in self.connection.execute(query, (*parameters, lane_limit)).fetchall():
                 merged.setdefault(str(row[0]), row)
                 if len(merged) >= limit:
                     break
             if len(merged) >= limit:
                 break
-        return list(merged.values())
+        result = tuple(merged.values())
+        self._retrieval_cache[cache_key] = result
+        self._retrieval_cache.move_to_end(cache_key)
+        while len(self._retrieval_cache) > self.config.retrieval_cache_size:
+            self._retrieval_cache.popitem(last=False)
+        return list(result)
 
     def debug_session(self, session_id: str) -> dict[str, object]:
         """Return target-blind session diagnostics for local evaluation tooling."""
@@ -494,7 +646,9 @@ class Agent:
                 key: sorted(values) for key, values in state.negated_slots.items()
             },
             "asked_attributes": list(state.asked_attributes),
+            "clarification_values_received": list(state.clarification_values_received),
             "retrieval_history": list(state.retrieval_history),
+            "runtime_stats": dict(self.runtime_stats),
         }
 
     @staticmethod
@@ -510,7 +664,7 @@ class Agent:
         max_price = slots.get("max_price")
         min_price = slots.get("min_price")
         target_price = slots.get("target_price")
-        denominator = max(min(len(rows) - 1, SPARSE_RANK_WINDOW - 1), 1)
+        denominator = max(min(len(rows) - 1, self.config.sparse_rank_window - 1), 1)
         for rank, row in enumerate(rows):
             (
                 asin, _bm25_score, price, title, features, categories, details, searchable_text,
@@ -518,7 +672,7 @@ class Agent:
                 brand, semantic_text,
             ) = row
             sparse_score = max(0.0, 1.0 - rank / denominator)
-            score = 0.60 * sparse_score
+            score = self.config.sparse_weight * sparse_score
             facet_fields = {
                 "category": f"{product_type or ''} {subtype or ''} {categories}",
                 "gender": str(department or ""),
@@ -526,63 +680,79 @@ class Agent:
                 "use_case": str(use_cases), "brand": str(brand), "feature": str(features),
                 "size": f"{sizes} {title} {features} {details}",
             }
-            weights = {
-                "category": 0.24, "gender": 0.16, "material": 0.18,
-                "color": 0.18, "size": 0.14, "style": 0.12, "use_case": 0.12,
-                "brand": 0.14, "feature": 0.12,
-            }
+            weights = self.config.facet_weights
             matched_constraints = 0
             for key, weight in weights.items():
                 if key not in slots:
                     continue
-                value = str(slots[key])
                 source = facet_fields.get(key, f"{title} {features} {details} {semantic_text}")
-                if key == "category":
-                    category_strength = self._category_match_strength(value, product_type, subtype, title, categories)
-                    if category_strength:
-                        score += category_strength
+                for value in _slot_values(slots[key]):
+                    if key == "category":
+                        category_strength = self._category_match_strength(
+                            value, product_type, subtype, title, categories
+                        )
+                        if category_strength:
+                            score += category_strength
+                            matched_constraints += 1
+                        else:
+                            score -= weight * self.config.mismatch_penalty_multiplier
+                        continue
+                    effective_weight = weight
+                    if self._exact_term(value, source):
+                        score += effective_weight * self.config.exact_match_multiplier
                         matched_constraints += 1
+                    elif key == "feature":
+                        coverage = self._term_coverage(value, source)
+                        if coverage >= 0.75:
+                            score += effective_weight * coverage
+                            matched_constraints += 1
+                        elif coverage >= 0.35:
+                            score += effective_weight * coverage * self.config.partial_match_multiplier
+                        else:
+                            score -= effective_weight * self.config.feature_mismatch_multiplier
+                    elif key in {"category", "gender"} and not source.strip():
+                        score -= self.config.missing_facet_penalty
                     else:
-                        score -= weight * 0.35
-                    continue
-                effective_weight = weight
-                if self._exact_term(value, source):
-                    score += effective_weight
-                    matched_constraints += 1
-                elif key == "feature":
-                    coverage = self._term_coverage(value, source)
-                    if coverage >= 0.75:
-                        score += effective_weight * coverage
-                        matched_constraints += 1
-                    elif coverage >= 0.35:
-                        score += effective_weight * coverage * 0.5
-                    else:
-                        score -= effective_weight * 0.15
-                elif key in {"category", "gender"} and not source.strip():
-                    score -= 0.03
-                else:
-                    score -= effective_weight * 0.35
+                        score -= effective_weight * self.config.mismatch_penalty_multiplier
             if matched_constraints >= 2:
-                score += min(0.04, 0.01 * matched_constraints)
+                score += min(
+                    self.config.multi_match_bonus_cap,
+                    self.config.multi_match_bonus * matched_constraints,
+                )
             for key, values in state.negated_slots.items():
                 source = facet_fields.get(key, searchable_text)
                 if any(self._exact_term(value, source) for value in values):
-                    score -= 0.25
+                    score -= self.config.negation_penalty
             if max_price is not None or min_price is not None or target_price is not None:
                 if price is None:
-                    score -= 0.05
+                    score -= self.config.unknown_price_penalty
                 else:
                     if max_price is not None:
-                        score += 0.14 if price <= float(max_price) else -0.30
+                        score += (
+                            self.config.price_match_bonus
+                            if price <= float(max_price)
+                            else -self.config.price_mismatch_penalty
+                        )
                     if min_price is not None:
-                        score += 0.14 if price >= float(min_price) else -0.30
+                        score += (
+                            self.config.price_match_bonus
+                            if price >= float(min_price)
+                            else -self.config.price_mismatch_penalty
+                        )
                     if target_price is not None:
                         relative_distance = abs(price - float(target_price)) / max(float(target_price), 1.0)
-                        score += 0.16 * max(0.0, 1.0 - relative_distance)
+                        score += self.config.target_price_bonus * max(0.0, 1.0 - relative_distance)
             if state.current_intent == "browsing":
-                expansions = semantic_expansions({str(value).lower() for value in slots.values()})
+                expansions = semantic_expansions({
+                    item for value in slots.values() for item in _slot_values(value)
+                })
                 semantic_hits = sum(self._exact_term(term, f"{semantic_text} {searchable_text}") for term in expansions)
-                score += min(semantic_hits * 0.03, 0.15)
+                score += min(
+                    semantic_hits * self.config.semantic_hit_bonus,
+                    self.config.semantic_bonus_cap,
+                )
+            if str(asin) not in state.shown_asins:
+                score += self.config.unseen_product_bonus
             scored.append((score, str(asin)))
         scored.sort(key=lambda item: (-item[0], item[1]))
         return [asin for _, asin in scored]
@@ -591,8 +761,8 @@ class Agent:
     def _exact_term(value: str, source: str) -> bool:
         return bool(re.search(rf"(?<![a-z0-9]){re.escape(value.lower())}(?![a-z0-9])", source.lower()))
 
-    @staticmethod
     def _category_match_strength(
+        self,
         requested: str,
         product_type: str | None,
         subtype: str | None,
@@ -605,16 +775,16 @@ class Agent:
             canonical == subtype.lower() or any(term == subtype.lower() for term in requested_terms)
         )
         if exact_subtype:
-            return 0.27
+            return self.config.category_weight * 1.125
         if product_type and product_type.lower() == canonical:
-            return 0.24
+            return self.config.category_weight
         if any(Agent._exact_term(term, title) for term in requested_terms):
-            return 0.25
+            return self.config.category_weight * (0.25 / 0.24)
         parent = CATEGORY_PARENTS.get(canonical)
         if parent and Agent._exact_term(parent, categories):
-            return 0.04
+            return self.config.category_weight * (0.04 / 0.24)
         if CATEGORY_PARENTS.get(product_type or "") == canonical:
-            return 0.10
+            return self.config.category_weight * (0.10 / 0.24)
         return 0.0
 
     @staticmethod
@@ -634,6 +804,42 @@ class Agent:
     def _next_attribute(self, state: SessionState, rows: list[tuple]) -> str | None:
         active = set(state.accumulated_slots)
         asked = set(state.asked_attributes) | state.declined_attributes
+        policy = self.config.clarification_policy
+
+        if policy == "two_batch":
+            question_count = len(state.asked_attributes)
+            if "other" in state.declined_attributes:
+                return None
+            return "other" if question_count < self.config.two_batch_question_limit else None
+
+        if policy == "confidence_gated":
+            informative = active - {
+                "category", "gender", "min_price", "max_price", "target_price"
+            }
+            confident = (
+                len(rows) <= self.config.confidence_candidate_threshold
+                or len(informative) >= self.config.confidence_constraint_threshold
+            )
+            if confident or "other" in state.declined_attributes:
+                return None
+            return "other" if state.asked_attributes.count("other") < 2 else None
+
+        if policy == "other_first" and "other" not in asked:
+            informative = active - {
+                "category", "gender", "min_price", "max_price", "target_price"
+            }
+            if not informative:
+                return "other"
+
+        if (
+            policy == "other_second"
+            and state.asked_attributes
+            and state.asked_attributes[-1] == "other"
+            and state.last_clarification_count == 2
+            and state.asked_attributes.count("other") < 2
+        ):
+            return "other"
+
         priorities = [
             ("material", "material"), ("color", "color"),
             ("feature", "feature"), ("style", "style"),
@@ -641,11 +847,7 @@ class Agent:
             ("budget", "budget"), ("brand", "brand"),
             ("category", "category"),
         ]
-        expected_value = {
-            "feature": 0.80, "material": 0.85, "color": 0.65,
-            "style": 0.45, "use_case": 0.40, "size": 0.30,
-            "budget": 0.25, "brand": 0.10, "category": 0.10,
-        }
+        expected_value = self.config.clarification_values
         candidates: list[tuple[float, int, str]] = []
         for index, (slot, attribute) in enumerate(priorities):
             slot_present = slot in active or (
@@ -654,11 +856,14 @@ class Agent:
             if slot_present or attribute in asked:
                 continue
             diversity = self._attribute_entropy(attribute, rows)
-            utility = expected_value[attribute] + 0.15 * diversity
+            utility = expected_value[attribute] + self.config.candidate_diversity_weight * diversity
             candidates.append((utility, -index, attribute))
         if candidates:
             candidates.sort(reverse=True)
-            return candidates[0][2]
+            typed = candidates[0][2]
+            if policy == "other_second" and state.asked_attributes and "other" not in asked:
+                return "other"
+            return typed
         return None
 
     @staticmethod

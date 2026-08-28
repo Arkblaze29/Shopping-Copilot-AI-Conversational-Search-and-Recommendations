@@ -98,10 +98,10 @@ The official evaluator remains the authoritative measurement source. Every mater
 ### Current measured baseline
 
 ```text
-Technical score:  0.784767
-Hit Rate@10:      0.945
-MRR:              0.544224
-MTTC:             3.550
+Technical score:  0.840644
+Hit Rate@10:      0.990
+MRR:              0.616480
+MTTC:             2.965
 ```
 
 ### Current milestone targets

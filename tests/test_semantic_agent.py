@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 from starter.agent import Agent, extract_slots
+from starter.config import AgentConfig
 from starter.semantics import extract_product_facets
 
 
@@ -279,6 +280,97 @@ class SemanticAgentTest(unittest.TestCase):
             first_ids = {item["parent_asin"] for item in first["recommendations"]}
             second_ids = {item["parent_asin"] for item in second["recommendations"]}
             self.assertFalse(first_ids & second_ids)
+
+    def test_two_batch_policy_collects_four_constraints_in_two_answers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            agent = Agent(
+                self._catalog(
+                    directory,
+                    [{"parent_asin": "A", "title": "blue cotton jacket", "price": 50}],
+                ),
+                AgentConfig(clarification_policy="two_batch"),
+            )
+            agent.reset("session", {})
+            first = agent.respond("session", "I'm looking for jackets, but I'm still exploring.", 1, 10)
+            second = agent.respond(
+                "session", "For that, what matters is: cotton; machine washable.", 2, 10
+            )
+            third = agent.respond(
+                "session", "For that, what matters is: color: blue; budget around $50.", 3, 10
+            )
+            slots = agent.sessions["session"].accumulated_slots
+            self.assertEqual(first["ask_attribute"], "other")
+            self.assertEqual(second["ask_attribute"], "other")
+            self.assertIsNone(third["ask_attribute"])
+            self.assertEqual(slots["material"], "cotton")
+            self.assertEqual(slots["feature"], "machine washable")
+            self.assertEqual(slots["color"], "blue")
+            self.assertEqual(slots["target_price"], 50.0)
+
+    def test_typed_clarification_preserves_multiple_values(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            agent = self._agent(directory, [{"parent_asin": "A", "title": "cotton polyester shirt"}])
+            agent.reset("session", {})
+            state = agent.sessions["session"]
+            state.last_asked_attribute = "material"
+            agent.respond(
+                "session", "For that, what matters is: cotton; polyester.", 2, 10
+            )
+            self.assertEqual(state.accumulated_slots["material"], ("cotton", "polyester"))
+
+    def test_two_batch_stops_after_boundary_declines_other(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            agent = Agent(
+                self._catalog(directory, [{"parent_asin": "A", "title": "jacket"}]),
+                AgentConfig(clarification_policy="two_batch"),
+            )
+            agent.reset("session", {})
+            first = agent.respond("session", "I'm looking for a jacket, but I'm still exploring.", 1, 10)
+            second = agent.respond(
+                "session", "I don't have a preference for other; please use your judgment.", 2, 10
+            )
+            self.assertEqual(first["ask_attribute"], "other")
+            self.assertIsNone(second["ask_attribute"])
+
+    def test_other_second_repeats_batch_only_after_two_values(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            agent = Agent(
+                self._catalog(directory, [{"parent_asin": "A", "title": "cotton shoe"}]),
+                AgentConfig(clarification_policy="other_second"),
+            )
+            agent.reset("session", {})
+            first = agent.respond("session", "I'm looking for shoes, but I'm still exploring.", 1, 10)
+            second = agent.respond(
+                "session", f"I don't have a preference for {first['ask_attribute']}; please use your judgment.", 2, 10
+            )
+            third = agent.respond(
+                "session", "For that, what matters is: cotton; machine washable.", 3, 10
+            )
+            fourth = agent.respond(
+                "session", "For that, what matters is: rubber sole.", 4, 10
+            )
+            self.assertEqual(second["ask_attribute"], "other")
+            self.assertEqual(third["ask_attribute"], "other")
+            self.assertNotEqual(fourth["ask_attribute"], "other")
+
+    def test_confidence_gated_policy_stops_for_small_candidate_pool(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            agent = Agent(
+                self._catalog(directory, [{"parent_asin": "A", "title": "unique jacket"}]),
+                AgentConfig(
+                    clarification_policy="confidence_gated",
+                    confidence_candidate_threshold=5,
+                ),
+            )
+            agent.reset("session", {})
+            response = agent.respond("session", "unique jacket", 1, 10)
+            self.assertIsNone(response["ask_attribute"])
+
+    @staticmethod
+    def _catalog(directory: str, rows: list[dict]) -> Path:
+        catalog = Path(directory) / "catalog.jsonl"
+        catalog.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+        return catalog
 
 
 if __name__ == "__main__":

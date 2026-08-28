@@ -43,8 +43,28 @@ python3 -m evaluator.local_evaluator
 Edit `starter/agent.py` to implement your system. Do not edit the evaluator or public labels when reporting your local score.
 The command writes per-session results and aggregate metrics to `results.json`.
 
+For fast startup, build the reproducible catalog-derived index once after downloading the catalog:
+
+```bash
+python3 -m experiments.build_index
+```
+
+The agent validates and loads `data/catalog_index.sqlite` into memory when present,
+and falls back to rebuilding directly from the read-only catalog when it is absent.
+
 The included weak BM25 starter scores Hit Rate@10 `0.125`, MRR `0.068034`, and
 MTTC `9.81` on the released public set. See `docs/baseline_results.json`.
+
+Run policy, runtime, and weight experiments with fixed scenario-stratified folds:
+
+```bash
+python3 -m experiments.optimize --stage policies
+python3 -m experiments.optimize --stage runtime
+python3 -m experiments.optimize --stage coordinate
+```
+
+Use `--sample-limit` for a quick stratified screen and validate finalists on all
+200 sessions before changing defaults.
 
 ## Agent Interface
 

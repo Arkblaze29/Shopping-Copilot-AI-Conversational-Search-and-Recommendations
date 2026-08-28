@@ -40,6 +40,27 @@ class DiagnosticMissAgent:
         }
 
 
+class BatchedQuestionAgent:
+    def reset(self, session_id: str, user_profile: dict) -> None:
+        self.history: list[dict] = []
+
+    def respond(self, session_id: str, user_message: str, turn: int, top_k: int) -> dict:
+        ask = "other" if turn <= 2 else None
+        self.history.append({
+            "turn": turn,
+            "intent": "browsing",
+            "active_slots": {},
+            "query_terms": ["shoe"],
+            "sparse_pool": ["B"],
+            "ranked_pool": ["B"],
+            "ask_attribute": ask,
+        })
+        return {"message": "question", "ask_attribute": ask, "recommendations": [{"parent_asin": "B"}]}
+
+    def debug_session(self, session_id: str) -> dict:
+        return {"retrieval_history": self.history}
+
+
 class EvaluatorTest(unittest.TestCase):
     def test_normalization_preserves_first_valid_unique_order(self) -> None:
         payload = [
@@ -118,6 +139,33 @@ class EvaluatorTest(unittest.TestCase):
         )
         self.assertEqual(result["diagnostic_summary"]["failure_modes"], {"ranking": 1})
         self.assertEqual(result["diagnostic_summary"]["recall_pool_hit_rate"], 1.0)
+
+    def test_diagnostics_measure_batched_constraint_disclosures(self) -> None:
+        products = {
+            "A": {
+                "parent_asin": "A",
+                "title": "Blue cotton running shoe",
+                "features": ["machine washable", "rubber sole"],
+                "categories": ["Clothing", "Shoes"],
+            },
+            "B": {"parent_asin": "B", "title": "boot", "categories": ["Clothing", "Boots"]},
+        }
+        samples = [{
+            "sample_id": "batched",
+            "scenario_type": "browsing",
+            "user_profile": {},
+            "ground_truth": {"parent_asin": "A"},
+        }]
+        result = evaluate(
+            BatchedQuestionAgent(), samples, {"A", "B"},
+            {"A": ["Shoes"], "B": ["Boots"]}, products,
+            include_diagnostics=True,
+        )
+        turns = result["sessions"][0]["diagnostics"]["turns"]
+        self.assertEqual(turns[1]["newly_disclosed_count"], 2)
+        self.assertEqual(turns[2]["newly_disclosed_count"], 2)
+        self.assertEqual(turns[2]["remaining_undisclosed_constraints"], 0)
+        self.assertEqual(result["diagnostic_summary"]["constraints_disclosed_by_questions"], 4)
 
 
 if __name__ == "__main__":

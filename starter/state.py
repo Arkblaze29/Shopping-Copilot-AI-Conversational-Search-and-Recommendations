@@ -31,6 +31,8 @@ class SessionState:
     subject_terms: list[str] = field(default_factory=list)
     shown_asins: set[str] = field(default_factory=set)
     retrieval_history: list[dict[str, object]] = field(default_factory=list)
+    clarification_values_received: list[str] = field(default_factory=list)
+    last_clarification_count: int = 0
 
     @classmethod
     def create(cls, session_id: str, user_profile: dict) -> "SessionState":
@@ -66,6 +68,26 @@ class SessionState:
                 self.negated_slots[key] = remaining
             else:
                 del self.negated_slots[key]
+
+    def add_slot_value(
+        self,
+        key: str,
+        value: object,
+        turn: int,
+        source_text: str,
+        *,
+        strength: SlotStrength = "hard",
+    ) -> None:
+        """Accumulate a batched clarification without losing earlier values."""
+        active = self.slots.get(key)
+        if active is None:
+            self.set_slot(key, value, turn, source_text, strength=strength)
+            return
+        existing = active.value if isinstance(active.value, tuple) else (active.value,)
+        additions = value if isinstance(value, tuple) else (value,)
+        merged = tuple(dict.fromkeys((*existing, *additions)))
+        stored: object = merged[0] if len(merged) == 1 else merged
+        self.set_slot(key, stored, turn, source_text, strength=strength)
 
     def negate_slot(self, key: str, value: str) -> None:
         normalized = value.lower()

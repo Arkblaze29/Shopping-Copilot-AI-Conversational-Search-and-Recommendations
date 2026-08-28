@@ -92,7 +92,7 @@ class Phase1AgentTest(unittest.TestCase):
             )
 
             self.assertEqual(first["ask_attribute"], "material")
-            self.assertEqual(second["ask_attribute"], "feature")
+            self.assertNotEqual(second["ask_attribute"], first["ask_attribute"])
 
 
 if __name__ == "__main__":

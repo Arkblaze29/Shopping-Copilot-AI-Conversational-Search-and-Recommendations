@@ -8,8 +8,10 @@ import statistics
 import uuid
 from collections import defaultdict
 from pathlib import Path
+from time import perf_counter
 
 from starter.agent import Agent
+from starter.config import AgentConfig
 
 
 MAX_TURNS = 10
@@ -222,9 +224,13 @@ def evaluate(
     *,
     include_diagnostics: bool = False,
 ) -> dict:
+    evaluation_started = perf_counter()
     sessions: list[dict] = []
     total_prompt_tokens = 0
     total_completion_tokens = 0
+    response_latencies: list[float] = []
+    first_response_latencies: list[float] = []
+    subsequent_response_latencies: list[float] = []
     for sample in samples:
         session_id = f"public_{uuid.uuid4().hex}"
         agent.reset(session_id, sample["user_profile"])
@@ -235,14 +241,27 @@ def evaluate(
         boundary_used = False
         override_applied = sample["scenario_type"] != "intent_override"
         user_message = initial_message(effective_sample, coarse_category(categories.get(target, [])), disclosed)
+        all_constraints = list(dict.fromkeys([
+            *[str(value) for value in effective_intent_card.get("hard_constraints", [])],
+            *[str(value) for value in effective_intent_card.get("soft_preferences", [])],
+        ]))
+        pending_disclosures: list[str] = []
+        pending_remaining = len([value for value in all_constraints if value not in disclosed])
+        pending_pool_before: int | None = None
+        pending_source: str | None = None
+        pending_answered_attribute: str | None = None
         hit_turn: int | None = None
         best_rank: int | None = None
         turn_diagnostics: list[dict] = []
         for turn in range(1, MAX_TURNS + 1):
+            response_started = perf_counter()
             try:
                 response = agent.respond(session_id, user_message, turn, TOP_K)
             except Exception:
                 response = {"message": "", "ask_attribute": None, "recommendations": []}
+            response_latency = perf_counter() - response_started
+            response_latencies.append(response_latency)
+            (first_response_latencies if turn == 1 else subsequent_response_latencies).append(response_latency)
             if not isinstance(response, dict) or not isinstance(response.get("message"), str):
                 response = {"message": "", "ask_attribute": None, "recommendations": []}
             usage = response.get("usage")
@@ -267,6 +286,13 @@ def evaluate(
                     "active_slots": trace.get("active_slots", {}) if isinstance(trace, dict) else {},
                     "query_terms": trace.get("query_terms", []) if isinstance(trace, dict) else [],
                     "ask_attribute": response.get("ask_attribute"),
+                    "answered_attribute": pending_answered_attribute,
+                    "disclosure_source": pending_source,
+                    "newly_disclosed_constraints": list(pending_disclosures),
+                    "newly_disclosed_count": len(pending_disclosures),
+                    "remaining_undisclosed_constraints": pending_remaining,
+                    "candidate_pool_before_answer": pending_pool_before,
+                    "candidate_pool_after_answer": len(sparse_pool),
                     "recall_pool_size": len(sparse_pool),
                     "target_sparse_rank": sparse_pool.index(target) + 1 if target in sparse_pool else None,
                     "target_reranked_rank": reranked_pool.index(target) + 1 if target in reranked_pool else None,
@@ -280,15 +306,26 @@ def evaluate(
                 break
             override = effective_sample.get("behavior", {}).get("override") or {}
             if not override_applied and turn + 1 == int(override.get("turn", 3)):
+                disclosed_before = set(disclosed)
                 override_applied = True
                 new_value = str(override.get("new_value", ""))
                 if new_value:
                     disclosed.add(new_value)
                 user_message = str(override.get("message", "Actually, please ignore my earlier preference."))
+                pending_disclosures = sorted(disclosed - disclosed_before)
+                pending_source = "override"
+                pending_answered_attribute = None
             else:
+                disclosed_before = set(disclosed)
+                answered_attribute = response.get("ask_attribute") if isinstance(response.get("ask_attribute"), str) else None
                 user_message, boundary_used = customer_reply(
                     effective_sample, response.get("ask_attribute"), disclosed, boundary_used
                 )
+                pending_disclosures = sorted(disclosed - disclosed_before)
+                pending_source = "clarification"
+                pending_answered_attribute = answered_attribute
+            pending_remaining = len([value for value in all_constraints if value not in disclosed])
+            pending_pool_before = len(sparse_pool) if include_diagnostics else None
         session_result = {
             "sample_id": sample["sample_id"],
             "scenario_type": sample["scenario_type"],
@@ -328,6 +365,13 @@ def evaluate(
             "total_tokens": total_prompt_tokens + total_completion_tokens,
         },
         "scenario_metrics": {name: metric_summary(grouped[name]) for name in sorted(grouped)},
+        "runtime": {
+            "evaluation_seconds": round(perf_counter() - evaluation_started, 6),
+            "response_count": len(response_latencies),
+            "average_response_seconds": round(statistics.fmean(response_latencies), 6) if response_latencies else 0.0,
+            "average_first_response_seconds": round(statistics.fmean(first_response_latencies), 6) if first_response_latencies else 0.0,
+            "average_subsequent_response_seconds": round(statistics.fmean(subsequent_response_latencies), 6) if subsequent_response_latencies else 0.0,
+        },
         "sessions": sessions,
     }
     if include_diagnostics:
@@ -341,7 +385,22 @@ def evaluate(
         result["diagnostic_summary"] = {
             "recall_pool_hit_rate": round(recall_hits / len(eligible_sessions), 6) if eligible_sessions else 0.0,
             "failure_modes": dict(sorted(failures.items())),
+            "clarification_answers": sum(
+                1
+                for item in eligible_sessions
+                for turn in item["diagnostics"]["turns"]
+                if turn.get("disclosure_source") == "clarification"
+            ),
+            "constraints_disclosed_by_questions": sum(
+                int(turn.get("newly_disclosed_count", 0))
+                for item in eligible_sessions
+                for turn in item["diagnostics"]["turns"]
+                if turn.get("disclosure_source") == "clarification"
+            ),
         }
+        runtime_stats = getattr(agent, "runtime_stats", None)
+        if isinstance(runtime_stats, dict):
+            result["runtime"]["agent"] = dict(runtime_stats)
     return result
 
 
@@ -349,19 +408,45 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="TechJam public-set local evaluator")
     parser.add_argument("--catalog", default="data/catalog.jsonl")
     parser.add_argument("--dataset", default="data/public_set.jsonl")
+    parser.add_argument("--scenario", help="Optional scenario_type filter for focused diagnostics")
     parser.add_argument("--output", default="results.json")
+    parser.add_argument(
+        "--policy",
+        choices=("current", "other_first", "other_second", "typed_only", "confidence_gated", "two_batch"),
+        default=AgentConfig().clarification_policy,
+    )
+    parser.add_argument(
+        "--config-json",
+        help="Optional JSON object or JSON file containing AgentConfig overrides.",
+    )
     parser.add_argument(
         "--diagnostics",
         action="store_true",
         help="Include target-aware retrieval diagnostics in the output file.",
     )
     args = parser.parse_args()
+    overrides: dict[str, object] = {"clarification_policy": args.policy}
+    if args.config_json:
+        candidate = Path(args.config_json)
+        payload = candidate.read_text(encoding="utf-8") if candidate.exists() else args.config_json
+        loaded = json.loads(payload)
+        if not isinstance(loaded, dict):
+            raise ValueError("--config-json must contain a JSON object")
+        overrides.update(loaded)
     samples = load_jsonl(args.dataset)
+    if args.scenario:
+        samples = [sample for sample in samples if str(sample.get("scenario_type")) == args.scenario]
+        if not samples:
+            raise ValueError(f"No samples found for scenario {args.scenario!r}")
     catalog_ids, categories, products = catalog_index(args.catalog)
+    initialization_started = perf_counter()
+    agent = Agent(args.catalog, AgentConfig().with_overrides(**overrides))
+    initialization_seconds = perf_counter() - initialization_started
     result = evaluate(
-        Agent(args.catalog), samples, catalog_ids, categories, products,
+        agent, samples, catalog_ids, categories, products,
         include_diagnostics=args.diagnostics,
     )
+    result["runtime"]["initialization_seconds"] = round(initialization_seconds, 6)
     Path(args.output).write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     print(json.dumps({key: value for key, value in result.items() if key != "sessions"}, indent=2))
 
