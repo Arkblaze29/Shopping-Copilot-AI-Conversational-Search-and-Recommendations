@@ -1,0 +1,455 @@
+from __future__ import annotations
+
+import argparse
+import json
+import random
+import re
+import statistics
+import uuid
+from collections import defaultdict
+from pathlib import Path
+from time import perf_counter
+
+from starter.agent import Agent
+from starter.config import AgentConfig
+
+
+MAX_TURNS = 10
+TOP_K = 10
+ALLOWED_ATTRIBUTES = {
+    "category", "material", "color", "size", "style", "brand",
+    "budget", "feature", "use_case", "other",
+}
+MATERIALS = ("cotton", "polyester", "nylon", "leather", "wool", "spandex", "silk", "rayon", "fabric")
+SEARCH_FIELDS = ("title", "features", "details", "description", "categories", "store")
+MATERIAL_RE = re.compile(r"\b(cotton|polyester|nylon|leather|wool|spandex|silk|rayon|fabric)\b", re.I)
+COLOR_RE = re.compile(r"\b(black|white|blue|red|pink|green|brown|gray|grey|purple|yellow|orange)\b", re.I)
+
+
+def searchable_text(product: dict) -> str:
+    parts: list[str] = []
+    for field in SEARCH_FIELDS:
+        value = product.get(field)
+        if isinstance(value, dict):
+            parts.extend(f"{key} {item}" for key, item in value.items())
+        elif isinstance(value, list):
+            parts.extend(str(item) for item in value)
+        elif value is not None:
+            parts.append(str(value))
+    return " ".join(parts).strip()
+
+
+def _flatten_values(value: object) -> list[str]:
+    if isinstance(value, dict):
+        return [f"{key}: {item}" for key, item in value.items() if item not in (None, "", [])]
+    if isinstance(value, list):
+        return [str(item) for item in value if item not in (None, "")]
+    return [str(value)] if value not in (None, "") else []
+
+
+def _clean_constraint(value: str, limit: int) -> str:
+    return re.sub(r"\s+", " ", value).strip(" -;,.\t\n")[:limit].rstrip()
+
+
+def intent_card(product: dict, limit: int = 180) -> dict:
+    title = _clean_constraint(str(product.get("title") or "product"), limit)
+    candidates = [*_flatten_values(product.get("features")), *_flatten_values(product.get("details"))]
+    corpus = searchable_text(product)
+    material = MATERIAL_RE.search(corpus)
+    color = COLOR_RE.search(corpus)
+    if material:
+        candidates.insert(0, material.group(1).lower())
+    if color:
+        candidates.insert(1, f"color: {color.group(1).lower()}")
+    if product.get("price") not in (None, ""):
+        candidates.append(f"budget around ${product['price']}")
+    cleaned = list(dict.fromkeys(_clean_constraint(item, limit) for item in candidates if _clean_constraint(item, limit)))
+    if not cleaned:
+        cleaned = [title]
+    return {
+        "target_category": title,
+        "hard_constraints": cleaned[:2],
+        "soft_preferences": cleaned[2:4] or cleaned[:1],
+    }
+
+
+def behavior_for(scenario: str, card: dict, rng: random.Random) -> dict:
+    behavior: dict = {"scenario_type": scenario}
+    if scenario == "intent_override":
+        hard = card["hard_constraints"]
+        soft = card["soft_preferences"]
+        old_value = soft[-1] if soft else "I prefer a different style."
+        new_value = hard[0] if hard else "Please prioritize the target requirements."
+        behavior["override"] = {
+            "turn": rng.choice([3, 4]),
+            "old_value": old_value,
+            "new_value": new_value,
+            "message": f"Actually, ignore my earlier preference. What I need is: {new_value}.",
+        }
+    return behavior
+
+
+def load_jsonl(path: str | Path) -> list[dict]:
+    with Path(path).open(encoding="utf-8") as handle:
+        return [json.loads(line) for line in handle if line.strip()]
+
+
+def normalize_recommendations(payload: object, catalog_ids: set[str]) -> list[str]:
+    if not isinstance(payload, list):
+        return []
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in payload:
+        value = item.get("parent_asin", "") if isinstance(item, dict) else item
+        parent_asin = str(value).strip()
+        if not parent_asin or parent_asin in seen or parent_asin not in catalog_ids:
+            continue
+        seen.add(parent_asin)
+        result.append(parent_asin)
+        if len(result) >= TOP_K:
+            break
+    return result
+
+
+def catalog_index(catalog_path: str | Path) -> tuple[set[str], dict[str, list[str]], dict[str, dict]]:
+    identifiers: set[str] = set()
+    categories: dict[str, list[str]] = {}
+    products: dict[str, dict] = {}
+    with Path(catalog_path).open(encoding="utf-8") as handle:
+        for line in handle:
+            product = json.loads(line)
+            parent_asin = str(product["parent_asin"])
+            identifiers.add(parent_asin)
+            categories[parent_asin] = [str(value) for value in product.get("categories") or []]
+            products[parent_asin] = product
+    return identifiers, categories, products
+
+
+def coarse_category(values: list[str]) -> str:
+    excluded = {"clothing", "clothing shoes & jewelry", "clothing, shoes & jewelry"}
+    cleaned: list[str] = []
+    for value in values:
+        for part in value.split(","):
+            part = part.strip()
+            if part and part.lower() not in excluded:
+                cleaned.append(part)
+    return " ".join(cleaned[-2:]) if cleaned else "clothing item"
+
+
+def classify_constraint(value: str) -> str:
+    lowered = value.lower()
+    if "budget" in lowered or re.search(r"(?:\$|<=|under)\s*\d", lowered):
+        return "budget"
+    if any(material in lowered for material in MATERIALS):
+        return "material"
+    if any(word in lowered for word in ("color", "black", "white", "blue", "red", "pink", "green")):
+        return "color"
+    if any(word in lowered for word in ("size", "sizing", "width", "wide", "narrow")):
+        return "size"
+    if any(word in lowered for word in ("department", "style", "fit", "sleeve", "neck")):
+        return "style"
+    if any(word in lowered for word in ("hiking", "running", "gym", "winter", "outdoor", "work")):
+        return "use_case"
+    return "feature"
+
+
+def initial_message(sample: dict, category: str, disclosed: set[str]) -> str:
+    scenario = sample["scenario_type"]
+    if scenario == "buying" and sample["intent_card"].get("hard_constraints"):
+        constraint = str(sample["intent_card"]["hard_constraints"][0])
+        disclosed.add(constraint)
+        return f"I'm looking for {category}. A key requirement is: {constraint}."
+    if scenario == "intent_override":
+        old_value = str(sample["behavior"]["override"]["old_value"])
+        return f"I'm looking for {category}. {old_value}"
+    return f"I'm looking for {category}, but I'm still exploring."
+
+
+def customer_reply(sample: dict, ask_attribute: object, disclosed: set[str], boundary_used: bool) -> tuple[str, bool]:
+    attribute = ask_attribute if isinstance(ask_attribute, str) else None
+    if sample["scenario_type"] == "boundary" and not boundary_used and attribute:
+        return f"I don't have a preference for {attribute}; please use your judgment.", True
+    if not attribute:
+        return "Those options are not quite right yet. Ask me about one specific attribute.", boundary_used
+    if attribute not in ALLOWED_ATTRIBUTES:
+        attribute = "other"
+    constraints = [
+        *[str(value) for value in sample["intent_card"].get("hard_constraints", [])],
+        *[str(value) for value in sample["intent_card"].get("soft_preferences", [])],
+    ]
+    matches = [
+        value for value in constraints
+        if value not in disclosed and (attribute == "other" or classify_constraint(value) == attribute)
+    ][:2]
+    if not matches:
+        return f"I don't have an additional preference for {attribute}.", boundary_used
+    disclosed.update(matches)
+    return "For that, what matters is: " + "; ".join(matches) + ".", boundary_used
+
+
+def metric_summary(sessions: list[dict]) -> dict:
+    if not sessions:
+        return {"sample_count": 0, "hit_rate_at_10": 0.0, "mrr": 0.0, "mttc": None}
+    hit_rate = sum(int(item["hit"]) for item in sessions) / len(sessions)
+    mrr = statistics.fmean(item["reciprocal_rank"] for item in sessions)
+    mttc = statistics.fmean(
+        item["first_hit_turn"] if item["first_hit_turn"] is not None else MAX_TURNS + 1 for item in sessions
+    )
+    return {
+        "sample_count": len(sessions),
+        "hit_rate_at_10": round(hit_rate, 6),
+        "mrr": round(mrr, 6),
+        "mttc": round(mttc, 6),
+    }
+
+
+def materialize_hidden_fields(sample: dict, products: dict[str, dict]) -> tuple[dict, dict]:
+    if "intent_card" in sample and "behavior" in sample:
+        return sample["intent_card"], sample["behavior"]
+    target = str(sample["ground_truth"]["parent_asin"])
+    product = products[target]
+    card = intent_card(product)
+    seed_source = f"{sample.get('sample_id', '')}\0{sample.get('scenario_type', '')}"
+    rng = random.Random(seed_source)
+    behavior = behavior_for(str(sample["scenario_type"]), card, rng)
+    return card, behavior
+
+
+def evaluate(
+    agent: Agent,
+    samples: list[dict],
+    catalog_ids: set[str],
+    categories: dict[str, list[str]],
+    products: dict[str, dict],
+    *,
+    include_diagnostics: bool = False,
+) -> dict:
+    evaluation_started = perf_counter()
+    sessions: list[dict] = []
+    total_prompt_tokens = 0
+    total_completion_tokens = 0
+    response_latencies: list[float] = []
+    first_response_latencies: list[float] = []
+    subsequent_response_latencies: list[float] = []
+    for sample in samples:
+        session_id = f"public_{uuid.uuid4().hex}"
+        agent.reset(session_id, sample["user_profile"])
+        target = str(sample["ground_truth"]["parent_asin"])
+        effective_intent_card, effective_behavior = materialize_hidden_fields(sample, products)
+        effective_sample = {**sample, "intent_card": effective_intent_card, "behavior": effective_behavior}
+        disclosed: set[str] = set()
+        boundary_used = False
+        override_applied = sample["scenario_type"] != "intent_override"
+        user_message = initial_message(effective_sample, coarse_category(categories.get(target, [])), disclosed)
+        all_constraints = list(dict.fromkeys([
+            *[str(value) for value in effective_intent_card.get("hard_constraints", [])],
+            *[str(value) for value in effective_intent_card.get("soft_preferences", [])],
+        ]))
+        pending_disclosures: list[str] = []
+        pending_remaining = len([value for value in all_constraints if value not in disclosed])
+        pending_pool_before: int | None = None
+        pending_source: str | None = None
+        pending_answered_attribute: str | None = None
+        hit_turn: int | None = None
+        best_rank: int | None = None
+        turn_diagnostics: list[dict] = []
+        for turn in range(1, MAX_TURNS + 1):
+            response_started = perf_counter()
+            try:
+                response = agent.respond(session_id, user_message, turn, TOP_K)
+            except Exception:
+                response = {"message": "", "ask_attribute": None, "recommendations": []}
+            response_latency = perf_counter() - response_started
+            response_latencies.append(response_latency)
+            (first_response_latencies if turn == 1 else subsequent_response_latencies).append(response_latency)
+            if not isinstance(response, dict) or not isinstance(response.get("message"), str):
+                response = {"message": "", "ask_attribute": None, "recommendations": []}
+            usage = response.get("usage")
+            if isinstance(usage, dict):
+                if isinstance(usage.get("prompt_tokens"), int) and usage["prompt_tokens"] >= 0:
+                    total_prompt_tokens += usage["prompt_tokens"]
+                if isinstance(usage.get("completion_tokens"), int) and usage["completion_tokens"] >= 0:
+                    total_completion_tokens += usage["completion_tokens"]
+            ranked = normalize_recommendations(response.get("recommendations"), catalog_ids)
+            if include_diagnostics:
+                debug_session = getattr(agent, "debug_session", None)
+                debug = debug_session(session_id) if callable(debug_session) else {}
+                history = debug.get("retrieval_history", []) if isinstance(debug, dict) else []
+                trace = history[-1] if isinstance(history, list) and history else {}
+                sparse_pool = trace.get("sparse_pool", []) if isinstance(trace, dict) else []
+                reranked_pool = trace.get("ranked_pool", []) if isinstance(trace, dict) else []
+                turn_diagnostics.append({
+                    "turn": turn,
+                    "eligible_for_hit": override_applied,
+                    "user_message": user_message,
+                    "intent": trace.get("intent") if isinstance(trace, dict) else None,
+                    "active_slots": trace.get("active_slots", {}) if isinstance(trace, dict) else {},
+                    "query_terms": trace.get("query_terms", []) if isinstance(trace, dict) else [],
+                    "ask_attribute": response.get("ask_attribute"),
+                    "answered_attribute": pending_answered_attribute,
+                    "disclosure_source": pending_source,
+                    "newly_disclosed_constraints": list(pending_disclosures),
+                    "newly_disclosed_count": len(pending_disclosures),
+                    "remaining_undisclosed_constraints": pending_remaining,
+                    "candidate_pool_before_answer": pending_pool_before,
+                    "candidate_pool_after_answer": len(sparse_pool),
+                    "recall_pool_size": len(sparse_pool),
+                    "target_sparse_rank": sparse_pool.index(target) + 1 if target in sparse_pool else None,
+                    "target_reranked_rank": reranked_pool.index(target) + 1 if target in reranked_pool else None,
+                    "target_recommended_rank": ranked.index(target) + 1 if target in ranked else None,
+                })
+            if override_applied and target in ranked:
+                best_rank = ranked.index(target) + 1
+                hit_turn = turn
+                break
+            if turn == MAX_TURNS:
+                break
+            override = effective_sample.get("behavior", {}).get("override") or {}
+            if not override_applied and turn + 1 == int(override.get("turn", 3)):
+                disclosed_before = set(disclosed)
+                override_applied = True
+                new_value = str(override.get("new_value", ""))
+                if new_value:
+                    disclosed.add(new_value)
+                user_message = str(override.get("message", "Actually, please ignore my earlier preference."))
+                pending_disclosures = sorted(disclosed - disclosed_before)
+                pending_source = "override"
+                pending_answered_attribute = None
+            else:
+                disclosed_before = set(disclosed)
+                answered_attribute = response.get("ask_attribute") if isinstance(response.get("ask_attribute"), str) else None
+                user_message, boundary_used = customer_reply(
+                    effective_sample, response.get("ask_attribute"), disclosed, boundary_used
+                )
+                pending_disclosures = sorted(disclosed - disclosed_before)
+                pending_source = "clarification"
+                pending_answered_attribute = answered_attribute
+            pending_remaining = len([value for value in all_constraints if value not in disclosed])
+            pending_pool_before = len(sparse_pool) if include_diagnostics else None
+        session_result = {
+            "sample_id": sample["sample_id"],
+            "scenario_type": sample["scenario_type"],
+            "hit": hit_turn is not None,
+            "first_hit_turn": hit_turn,
+            "best_rank": best_rank,
+            "reciprocal_rank": 0.0 if best_rank is None else 1.0 / best_rank,
+        }
+        if include_diagnostics:
+            eligible_turns = [item for item in turn_diagnostics if item["eligible_for_hit"]]
+            entered_recall_pool = any(item["target_sparse_rank"] is not None for item in eligible_turns)
+            entered_top_10 = any(item["target_recommended_rank"] is not None for item in eligible_turns)
+            failure_mode = None
+            if hit_turn is None:
+                failure_mode = "ranking" if entered_recall_pool else "retrieval"
+            session_result["diagnostics"] = {
+                "entered_recall_pool": entered_recall_pool,
+                "entered_top_10": entered_top_10,
+                "failure_mode": failure_mode,
+                "turns": turn_diagnostics,
+            }
+        sessions.append(session_result)
+
+    overall = metric_summary(sessions)
+    efficiency = max(0.0, min(1.0, (11.0 - float(overall["mttc"])) / 10.0))
+    technical_score = 0.50 * overall["hit_rate_at_10"] + 0.30 * overall["mrr"] + 0.20 * efficiency
+    grouped: dict[str, list[dict]] = defaultdict(list)
+    for session in sessions:
+        grouped[session["scenario_type"]].append(session)
+    result = {
+        **overall,
+        "efficiency": round(efficiency, 6),
+        "recommended_technical_score": round(technical_score, 6),
+        "reported_token_usage": {
+            "prompt_tokens": total_prompt_tokens,
+            "completion_tokens": total_completion_tokens,
+            "total_tokens": total_prompt_tokens + total_completion_tokens,
+        },
+        "scenario_metrics": {name: metric_summary(grouped[name]) for name in sorted(grouped)},
+        "runtime": {
+            "evaluation_seconds": round(perf_counter() - evaluation_started, 6),
+            "response_count": len(response_latencies),
+            "average_response_seconds": round(statistics.fmean(response_latencies), 6) if response_latencies else 0.0,
+            "average_first_response_seconds": round(statistics.fmean(first_response_latencies), 6) if first_response_latencies else 0.0,
+            "average_subsequent_response_seconds": round(statistics.fmean(subsequent_response_latencies), 6) if subsequent_response_latencies else 0.0,
+        },
+        "sessions": sessions,
+    }
+    if include_diagnostics:
+        eligible_sessions = [item for item in sessions if item.get("diagnostics")]
+        recall_hits = sum(int(item["diagnostics"]["entered_recall_pool"]) for item in eligible_sessions)
+        failures: dict[str, int] = defaultdict(int)
+        for item in eligible_sessions:
+            mode = item["diagnostics"]["failure_mode"]
+            if mode:
+                failures[mode] += 1
+        result["diagnostic_summary"] = {
+            "recall_pool_hit_rate": round(recall_hits / len(eligible_sessions), 6) if eligible_sessions else 0.0,
+            "failure_modes": dict(sorted(failures.items())),
+            "clarification_answers": sum(
+                1
+                for item in eligible_sessions
+                for turn in item["diagnostics"]["turns"]
+                if turn.get("disclosure_source") == "clarification"
+            ),
+            "constraints_disclosed_by_questions": sum(
+                int(turn.get("newly_disclosed_count", 0))
+                for item in eligible_sessions
+                for turn in item["diagnostics"]["turns"]
+                if turn.get("disclosure_source") == "clarification"
+            ),
+        }
+        runtime_stats = getattr(agent, "runtime_stats", None)
+        if isinstance(runtime_stats, dict):
+            result["runtime"]["agent"] = dict(runtime_stats)
+    return result
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="TechJam public-set local evaluator")
+    parser.add_argument("--catalog", default="data/catalog.jsonl")
+    parser.add_argument("--dataset", default="data/public_set.jsonl")
+    parser.add_argument("--scenario", help="Optional scenario_type filter for focused diagnostics")
+    parser.add_argument("--output", default="results.json")
+    parser.add_argument(
+        "--policy",
+        choices=("current", "other_first", "other_second", "typed_only", "confidence_gated", "two_batch"),
+        default=AgentConfig().clarification_policy,
+    )
+    parser.add_argument(
+        "--config-json",
+        help="Optional JSON object or JSON file containing AgentConfig overrides.",
+    )
+    parser.add_argument(
+        "--diagnostics",
+        action="store_true",
+        help="Include target-aware retrieval diagnostics in the output file.",
+    )
+    args = parser.parse_args()
+    overrides: dict[str, object] = {"clarification_policy": args.policy}
+    if args.config_json:
+        candidate = Path(args.config_json)
+        payload = candidate.read_text(encoding="utf-8") if candidate.exists() else args.config_json
+        loaded = json.loads(payload)
+        if not isinstance(loaded, dict):
+            raise ValueError("--config-json must contain a JSON object")
+        overrides.update(loaded)
+    samples = load_jsonl(args.dataset)
+    if args.scenario:
+        samples = [sample for sample in samples if str(sample.get("scenario_type")) == args.scenario]
+        if not samples:
+            raise ValueError(f"No samples found for scenario {args.scenario!r}")
+    catalog_ids, categories, products = catalog_index(args.catalog)
+    initialization_started = perf_counter()
+    agent = Agent(args.catalog, AgentConfig().with_overrides(**overrides))
+    initialization_seconds = perf_counter() - initialization_started
+    result = evaluate(
+        agent, samples, catalog_ids, categories, products,
+        include_diagnostics=args.diagnostics,
+    )
+    result["runtime"]["initialization_seconds"] = round(initialization_seconds, 6)
+    Path(args.output).write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+    print(json.dumps({key: value for key, value in result.items() if key != "sessions"}, indent=2))
+
+
+if __name__ == "__main__":
+    main()

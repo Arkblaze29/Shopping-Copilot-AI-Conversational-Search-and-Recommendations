@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.env
+*.log
+
+# Generated evaluator output
+results*.json
+experiment_results*.json
+
+# Downloaded or generated local data artifacts
+data/catalog.jsonl
+data/catalog.jsonl.gz
+data/catalog_index.sqlite
+data/catalog_index.sqlite.tmp
