@@ -77,13 +77,60 @@ python -m experiments.build_index
 
 This creates `data/catalog_index.sqlite`, a catalog-derived SQLite FTS5 index. It makes startup faster, is validated against the catalog before use, and can be deleted safely: the agent rebuilds the index in memory when it is absent.
 
-### 3. Run the tests
+### 3. Run the interactive demo
+
+```bash
+python demo.py
+```
+
+Type one shopper message per turn. Each message is sent as the next turn in the same session, so the demo shows the real stateful dialogue rather than isolated searches. After every turn it prints:
+
+- the agent's response and its single supported `ask_attribute` (or `none`);
+- the current Buying/Browsing intent and compact target-blind active/negated preferences;
+- five readable product rows containing rank, title, ASIN, and price when available.
+
+The wrapper requests `top_k=10` from the unchanged official API. It displays only the first five rows to keep a terminal recording easy to read; the full Top 10 is still produced and the evaluator's ranking behavior is unchanged. The exact follow-up attribute can vary because it is chosen from the current conversation state. Use `/new` to reset the session for a new scenario, or `quit`, `exit`, or an empty line to stop.
+
+Recommended video prompts:
+
+```text
+I need black leather ankle boots under $100.
+I'm exploring ideas for a summer wedding guest outfit.
+I'm looking for a red leather handbag.
+Actually, ignore my earlier preference. I need a waterproof backpack instead.
+```
+
+Use `/new` before each independent scenario. Running `python -m experiments.build_index` first is optional but reduces demo startup time.
+
+For a three-minute recording, show three short decision moments:
+
+1. **Vague occasion request:** demonstrate broad browsing and the agent's one follow-up question.
+2. **Precise purchase request:** demonstrate constraint-first retrieval without an unnecessary question.
+3. **Intent change:** send a new request that contradicts an earlier preference and show the updated state and recommendations.
+
+Example interaction (the wording of the agent response and question is data-dependent):
+
+```text
+YOU: I need black leather ankle boots under $100.
+AGENT: <recommendation response>
+ASK_ATTRIBUTE: <one attribute or none>
+INTENT: Buying
+ACTIVE: category=boots, colour=black, material=leather, price_max=100
+NEGATED: none
+TOP PRODUCTS:
+  1. <title> | <ASIN> | $<price>
+  ...
+```
+
+When moving to the next video moment, type `/new`; this clears the conversation ledger while keeping the catalog and agent loaded.
+
+### 4. Run the tests
 
 ```bash
 python -m unittest discover -s tests -q
 ```
 
-### 4. Reproduce the public evaluation
+### 5. Reproduce the public evaluation
 
 ```bash
 python -m evaluator.local_evaluator
@@ -114,6 +161,7 @@ response = agent.respond(session_id, user_message, turn, top_k=10)
 ## Repository layout
 
 ```text
+demo.py             interactive, target-blind terminal demonstration
 starter/
   agent.py          conversation flow, retrieval, ranking, and API entry point
   config.py         reproducible retrieval/ranking/dialogue parameters
