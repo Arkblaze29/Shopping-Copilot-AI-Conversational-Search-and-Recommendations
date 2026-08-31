@@ -29,11 +29,11 @@ The system is target-blind at runtime: it never receives the hidden target or ev
 
 ## Results
 
-The weak supplied BM25 starter achieved a TechnicalScore of `0.125`. The final agent was evaluated with the official local evaluator on the same public set.
+The weak supplied BM25 starter achieved a TechnicalScore of `0.106710`. The final agent was evaluated with the official local evaluator on the same public set.
 
 | Metric | Starter baseline | Final agent |
 | --- | ---: | ---: |
-| TechnicalScore | 0.125000 | **0.845444** |
+| TechnicalScore | 0.106710 | **0.845444** |
 | Hit Rate@10 | 0.125000 | **0.995000** |
 | MRR | 0.068034 | **0.621480** |
 | MTTC | 9.810 | **2.925** |
